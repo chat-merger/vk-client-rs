@@ -16,5 +16,8 @@ run:
 build:
     cargo build
 
+doc:
+    cargo doc --open
+
 clean:
     cargo clean

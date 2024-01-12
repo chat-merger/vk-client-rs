@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::future_not_send)]
 
 // TODO: add docs
 //       infallible deserialization
@@ -7,13 +7,28 @@
 
 mod api;
 mod ext;
+mod grpc {
+    #![allow(
+        clippy::similar_names,
+        unused_mut,
+        clippy::doc_markdown,
+        clippy::missing_const_for_fn,
+        clippy::trivially_copy_pass_by_ref,
+        clippy::use_self,
+        clippy::wildcard_imports,
+        clippy::default_trait_access
+    )]
 
-use core::fmt;
-use std::env;
+    tonic::include_proto!("mergerapi");
+}
 
+use std::{env, fmt, sync::Arc};
+
+use futures::{future::LocalBoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_aux::field_attributes::deserialize_number_from_string;
 use serde_repr::Deserialize_repr;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, Layer};
 use url::Url;
@@ -21,6 +36,8 @@ use url::Url;
 use crate::ext::ResponseJsonErrorPath as _;
 
 const GROUP_ID: u64 = 224_192_083;
+const AUTH_HEADER: &str = "x-api-key";
+const PEER_ID: u64 = 2_000_000_002;
 
 fn init() -> color_eyre::Result<()> {
     dotenvy::dotenv()?;
@@ -31,7 +48,7 @@ fn init() -> color_eyre::Result<()> {
         .init();
 
     env::set_var("RUST_SPANTRACE", "1");
-    env::set_var("RUST_LIB_BACKTRACE", "0");
+    env::set_var("RUST_LIB_BACKTRACE", "1");
 
     Ok(())
 }
@@ -41,17 +58,142 @@ async fn main() -> color_eyre::Result<()> {
     init()?;
 
     let token = env::var("VK_API_TOKEN")?;
+    let api_key = env::var("X_API_KEY")?;
+    let host: tonic::transport::Uri = env::var("SERVER_HOST")?.parse()?;
 
-    Bot::new(token, GROUP_ID).run().await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+    let mut client = {
+        let channel = tonic::transport::Channel::builder(host).connect().await?;
+        grpc::base_service_client::BaseServiceClient::new(channel)
+    };
+
+    let request = {
+        let mut meta = tonic::metadata::MetadataMap::new();
+        meta.append(AUTH_HEADER, api_key.parse()?);
+        let exts = tonic::Extensions::default();
+
+        tonic::Request::from_parts(meta, exts, ReceiverStream::new(rx))
+    };
+
+    let bot = Bot::new(token, GROUP_ID);
+
+    tokio::spawn({
+        let bot = bot.clone();
+        async move {
+            let response = client.connect(request).await?;
+
+            let mut stream = response.into_inner();
+            while let Some(response) = stream.message().await? {
+                tracing::debug!("{response:#?}");
+
+                let grpc::Response {
+                    reply_msg_id,
+                    author,
+                    client,
+                    body,
+                    ..
+                } = response;
+
+                let text = body.as_ref().map_or_else(
+                    || "no text",
+                    |b| match b {
+                        grpc::response::Body::Text(t) => t.value.as_str(),
+                        grpc::response::Body::Media(_) => "",
+                    },
+                );
+                let reply = reply_msg_id
+                    .as_deref()
+                    .map(|id| format!("reply to: {id}"))
+                    .unwrap_or_default();
+                let author = author.as_deref().unwrap_or_default();
+
+                bot.send_message(
+                    PEER_ID,
+                    format!(
+                        r#"
+{reply}
+[{author} from {client}]: {text}"#
+                    ),
+                )
+                .await?;
+            }
+
+            color_eyre::Result::<_, color_eyre::Report>::Ok(())
+        }
+    });
+
+    let on_message = {
+        let tx = tx.clone();
+        let bot = bot.clone();
+        move |message: Message| {
+            let tx = tx.clone();
+            let bot = bot.clone();
+            async move {
+                let author = if message.from_id > 0 {
+                    let [UsersGetResponse {
+                        first_name,
+                        last_name,
+                        ..
+                    }]: [UsersGetResponse; 1] = get(
+                        &bot.client,
+                        "users.get",
+                        &[
+                            ("user_ids", message.from_id.to_string().as_str()),
+                            ("access_token", bot.token.as_str()),
+                            ("v", "5.199"),
+                        ],
+                    )
+                    .await?;
+                    format!("{first_name} {last_name}")
+                } else {
+                    "Unknown".to_owned()
+                };
+
+                tx.send(grpc::Request {
+                    reply_msg_id: message.reply.map(|r| r.id.to_string()),
+                    created_at: message.date.try_into()?,
+                    author: Some(author),
+                    is_silent: false,
+                    body: Some(grpc::request::Body::Text(grpc::Text {
+                        format: grpc::text::Format::Plain as i32,
+                        value: message.text,
+                    })),
+                })
+                .await?;
+
+                Ok(())
+            }
+            .boxed_local()
+        }
+    };
+
+    bot.on_message(on_message).run().await?;
 
     Ok(())
 }
 
+type Callback =
+    Arc<dyn Fn(Message) -> LocalBoxFuture<'static, color_eyre::Result<()>> + Send + Sync>;
+
+#[derive(Clone)]
 struct Bot {
     token: String,
     client: reqwest::Client,
     group_id: u64,
     wait: usize,
+    on_message: Option<Callback>,
+}
+
+impl fmt::Debug for Bot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bot")
+            .field("token", &self.token)
+            .field("client", &self.client)
+            .field("group_id", &self.group_id)
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Bot {
@@ -61,11 +203,20 @@ impl Bot {
             client: reqwest::Client::new(),
             group_id,
             wait: 25,
+            on_message: None,
         }
     }
 
+    fn on_message<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(Message) -> LocalBoxFuture<'static, color_eyre::Result<()>> + Send + Sync + 'static,
+    {
+        self.on_message = Some(Arc::new(callback));
+        self
+    }
+
     #[tracing::instrument(skip_all)]
-    async fn run(self) -> color_eyre::Result<()> {
+    async fn run(&self) -> color_eyre::Result<()> {
         let GetLongPollServerResponse {
             key,
             server,
@@ -93,7 +244,7 @@ impl Bot {
                 .json_error_path::<serde_json::Value>()
                 .await?;
 
-            let new_ts: u32 = resp
+            let new_ts: i32 = resp
                 .get("ts")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
@@ -104,9 +255,10 @@ impl Bot {
             let LongPollingResponse {
                 ts: new_ts,
                 updates,
-            } = match serde_json::from_value(resp) {
+            } = match serde_json::from_value(resp.clone()) {
                 Ok(resp) => resp,
                 Err(e) => {
+                    tracing::debug!("{resp:#?}");
                     tracing::error!("error deserializing `LongPollingResponse: {e}");
                     continue;
                 }
@@ -116,14 +268,15 @@ impl Bot {
                 tracing::debug!(?update, "update");
                 match update {
                     Update::MessageNew {
-                        object:
-                            Object {
-                                message: m @ Message { peer_id, .. },
-                                ..
-                            },
+                        object: Object { message, .. },
                         ..
                     } => {
-                        self.send_message(peer_id, format!("{m:#?}")).await?;
+                        if let Some(cb) = &self.on_message {
+                            cb(message).await.map_err(|err| {
+                                tracing::error!("{err}");
+                                err
+                            })?;
+                        }
                     }
                 }
             }
@@ -132,7 +285,6 @@ impl Bot {
         }
     }
 
-    #[allow(clippy::future_not_send)]
     #[tracing::instrument(skip_all)]
     async fn send_message(&self, peer_id: u64, text: impl AsRef<str>) -> color_eyre::Result<()> {
         let text = text.as_ref();
@@ -140,7 +292,7 @@ impl Bot {
             &self.client,
             "messages.send",
             &[
-                ("peer_id", (peer_id).to_string().as_str()),
+                ("peer_id", peer_id.to_string().as_str()),
                 ("random_id", "0"),
                 ("message", text),
                 ("group_id", self.group_id.to_string().as_str()),
@@ -156,8 +308,7 @@ impl Bot {
     }
 }
 
-#[allow(clippy::future_not_send)]
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip(client, query))]
 async fn get<Response>(
     client: &reqwest::Client,
     method: &'static str,
@@ -271,18 +422,24 @@ struct GetLongPollServerResponse {
     key: String,
     server: Url,
     #[serde(deserialize_with = "deserialize_number_from_string")]
-    ts: u32,
+    ts: i32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SendMessageResponse {}
+struct UsersGetResponse {
+    id: u64,
+    first_name: String,
+    last_name: String,
+    can_access_closed: bool,
+    is_closed: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LongPollingResponse {
     #[serde(deserialize_with = "deserialize_number_from_string")]
-    ts: u32,
+    ts: i32,
     #[serde(rename = "updates")]
     updates: Vec<Update>,
 }
@@ -321,7 +478,7 @@ struct ClientInfo {
 #[serde(deny_unknown_fields)]
 struct Message {
     date: u64,
-    from_id: u64,
+    from_id: i64,
     id: u64,
     out: u64,
     version: u64,
@@ -344,7 +501,7 @@ struct ReplyMessage {
     attachments: Vec<Attachment>,
     conversation_message_id: u64,
     date: u64,
-    from_id: u64,
+    from_id: i64,
     id: u64,
     peer_id: u64,
     text: String,
@@ -367,7 +524,7 @@ struct Attachment {
 enum AttachmentType {
     #[serde(rename = "photo")]
     Photo {
-        album_id: u64,
+        album_id: i64,
         date: u64,
         id: u64,
         owner_id: u64,
